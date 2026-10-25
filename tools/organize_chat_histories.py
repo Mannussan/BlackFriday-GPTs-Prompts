@@ -47,6 +47,28 @@ class Move:
     destination: Path
 
 
+def shown_path(path: Path | str) -> str:
+    """Show regular Windows paths even when filesystem operations use long paths."""
+    value = str(path)
+    if os.name == "nt":
+        if value.startswith("\\\\?\\UNC\\"):
+            return "\\\\" + value[8:]
+        return value.removeprefix("\\\\?\\")
+    return value
+
+
+def filesystem_path(path: Path) -> Path:
+    """Support long local and UNC paths without changing Windows settings."""
+    if os.name != "nt":
+        return path
+    value = str(path.resolve())
+    if value.startswith("\\\\?\\"):
+        return Path(value)
+    if value.startswith("\\\\"):
+        return Path("\\\\?\\UNC\\" + value[2:])
+    return Path("\\\\?\\" + value)
+
+
 def default_desktop() -> Path:
     """Use the Windows Desktop setting, including redirected OneDrive desktops."""
     if sys.platform == "win32":
@@ -81,7 +103,7 @@ def read_pdf(path: Path) -> str:
         try:
             return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
         except Exception as error:
-            print(f"Hinweis: PDF nicht lesbar: {path} ({error})")
+            print(f"Hinweis: PDF nicht lesbar: {shown_path(path)} ({error})")
             return ""
     try:
         result = subprocess.run(["pdftotext", "-layout", str(path), "-"], check=False,
@@ -90,7 +112,7 @@ def read_pdf(path: Path) -> str:
             return result.stdout
     except (OSError, subprocess.TimeoutExpired):
         pass
-    print(f"Hinweis: PDF uebersprungen: {path}. PDF-Unterstuetzung fehlt oder kein Text auslesbar.")
+    print(f"Hinweis: PDF uebersprungen: {shown_path(path)}. PDF-Unterstuetzung fehlt oder kein Text auslesbar.")
     return ""
 
 
@@ -132,7 +154,7 @@ def similarity(left: Document, right: Document) -> float:
 
 
 def find_files(root: Path) -> list[Path]:
-    own_directory = Path(__file__).resolve().parent.parent
+    own_directory = Path(shown_path(Path(__file__).resolve().parent.parent))
     files = []
     def report_walk_error(error):
         print(f"Hinweis: Ordner nicht lesbar: {error.filename}")
@@ -141,7 +163,7 @@ def find_files(root: Path) -> list[Path]:
                           if name.casefold() not in SKIP_DIRECTORIES
                           and not (Path(directory) / name).is_symlink()
                           and not (hasattr(Path, "is_junction") and (Path(directory) / name).is_junction())
-                          and (Path(directory) / name).resolve() != own_directory)
+                          and Path(shown_path((Path(directory) / name).resolve())) != own_directory)
         for filename in sorted(filenames):
             path = Path(directory) / filename
             if (path.suffix.casefold() in SUPPORTED_EXTENSIONS and path.is_file()
@@ -192,7 +214,8 @@ def unique_destination(directory: Path, filename: str, reserved: set[Path] | Non
 
 
 def organize(root: Path, threshold: float, apply: bool) -> None:
-    print(f"Suche Markdown- und PDF-Dateien unter: {root}", flush=True)
+    root = filesystem_path(root)
+    print(f"Suche Markdown- und PDF-Dateien unter: {shown_path(root)}", flush=True)
     files = find_files(root)
     documents = []
     for index, path in enumerate(files, start=1):
@@ -201,12 +224,12 @@ def organize(root: Path, threshold: float, apply: bool) -> None:
         try:
             documents.append(load_document(path))
         except OSError as error:
-            print(f"Hinweis: Datei uebersprungen: {path} ({error})")
+            print(f"Hinweis: Datei uebersprungen: {shown_path(path)} ({error})")
     empty = [doc for doc in documents if not doc.text.strip()]
     documents = [doc for doc in documents if doc.text.strip()]
     groups = build_groups(documents, threshold)
 
-    print(f"Geprueft: {len(files)} Dateien unter {root}")
+    print(f"Geprueft: {len(files)} Dateien unter {shown_path(root)}")
     if empty:
         print(f"Leere oder nicht auslesbare Dateien uebersprungen: {len(empty)}")
     movable_groups = [group for group in groups if len(group) >= 2]
@@ -224,7 +247,7 @@ def organize(root: Path, threshold: float, apply: bool) -> None:
             destination = unique_destination(folder, document.path.name, reserved)
             reserved.add(destination)
             plan.append(Move(document, destination))
-            print(f"  {document.path}\n    -> {destination}")
+            print(f"  {shown_path(document.path)}\n    -> {shown_path(destination)}")
 
     print(f"\nVorschlag: {len(plan)} Dateien in {len(movable_groups)} Gruppen.")
     if not apply:
@@ -274,11 +297,11 @@ def organize(root: Path, threshold: float, apply: bool) -> None:
                     move.destination.unlink(missing_ok=True)
                 raise
             completed += 1
-            print(f"Verschoben: {move.document.path} -> {move.destination}")
+            print(f"Verschoben: {shown_path(move.document.path)} -> {shown_path(move.destination)}")
     except (OSError, KeyboardInterrupt):
         print(f"Vorgang gestoppt. Bereits verschoben: {completed} von {len(plan)} Dateien.")
         raise
-    print(f"\nFertig. {completed} Dateien wurden nach {root / OUTPUT_DIRECTORY} verschoben.")
+    print(f"\nFertig. {completed} Dateien wurden nach {shown_path(root / OUTPUT_DIRECTORY)} verschoben.")
 
 
 class GermanArgumentParser(argparse.ArgumentParser):
@@ -309,7 +332,7 @@ def main() -> None:
     if not 0.0 <= args.threshold <= 1.0:
         raise SystemExit("Fehler: --threshold muss zwischen 0.0 und 1.0 liegen.")
     root = Path(args.root).expanduser().resolve()
-    if not root.exists() or not root.is_dir():
+    if not filesystem_path(root).is_dir():
         raise SystemExit(f"Fehler: Ordner nicht gefunden: {root}")
     try:
         organize(root, args.threshold, args.apply)
