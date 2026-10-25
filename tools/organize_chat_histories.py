@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import os
 import re
 import shutil
 import subprocess
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -21,6 +23,11 @@ from typing import Iterable
 
 SUPPORTED_EXTENSIONS = {".md", ".markdown", ".pdf"}
 OUTPUT_DIRECTORY = "Chatverlaeufe_sortiert"
+SKIP_DIRECTORIES = {OUTPUT_DIRECTORY.casefold(), ".git", ".venv", "venv", "node_modules", "__pycache__", ".codex", ".agents", "_vendor"}
+# Optional PDF dependency bundled in the local Windows download.
+VENDOR_DIRECTORY = Path(__file__).resolve().parent.parent / "_vendor"
+if VENDOR_DIRECTORY.is_dir():
+    sys.path.insert(0, str(VENDOR_DIRECTORY))
 STOPWORDS = {
     "aber", "alle", "also", "and", "auf", "aus", "bei", "chatgpt", "dass", "dem", "den", "der", "die", "dies", "ein", "eine", "einer", "eines", "for", "from", "haben", "ich", "ist", "mit", "nicht", "oder", "sich", "sie", "the", "und", "von", "was", "wir", "you", "zur",
 }
@@ -31,6 +38,33 @@ class Document:
     text: str
     fingerprint: str
     tokens: frozenset[str]
+    signature: tuple[int, int] = (0, 0)
+
+
+@dataclass(frozen=True)
+class Move:
+    document: Document
+    destination: Path
+
+
+def default_desktop() -> Path:
+    """Use the Windows Desktop setting, including redirected OneDrive desktops."""
+    if sys.platform == "win32":
+        try:
+            import winreg
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                    r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders") as key:
+                desktop, _ = winreg.QueryValueEx(key, "Desktop")
+            candidate = Path(os.path.expandvars(desktop))
+            if candidate.is_dir():
+                return candidate
+        except OSError:
+            pass
+    for base in (Path.home(), *(Path(os.environ[name]) for name in
+            ("OneDrive", "OneDriveConsumer", "OneDriveCommercial") if os.environ.get(name))):
+        if (base / "Desktop").is_dir():
+            return base / "Desktop"
+    return Path.home() / "Desktop"
 
 
 def read_markdown(path: Path) -> str:
@@ -39,13 +73,24 @@ def read_markdown(path: Path) -> str:
 
 def read_pdf(path: Path) -> str:
     """Extract PDF text with local command-line tools when available."""
-    for command in (["pdftotext", "-layout", str(path), "-"], ["python3", "-m", "pypdf", str(path)]):
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        pass
+    else:
         try:
-            result = subprocess.run(command, check=False, capture_output=True, text=True, timeout=30)
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            continue
+            return "\n".join(page.extract_text() or "" for page in PdfReader(path).pages)
+        except Exception as error:
+            print(f"Hinweis: PDF nicht lesbar: {path} ({error})")
+            return ""
+    try:
+        result = subprocess.run(["pdftotext", "-layout", str(path), "-"], check=False,
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=30)
         if result.returncode == 0 and result.stdout.strip():
             return result.stdout
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    print(f"Hinweis: PDF uebersprungen: {path}. PDF-Unterstuetzung fehlt oder kein Text auslesbar.")
     return ""
 
 
@@ -65,11 +110,16 @@ def token_shingles(tokens: list[str], size: int = 5) -> frozenset[str]:
 
 
 def load_document(path: Path) -> Document:
+    before = path.stat()
     text = read_pdf(path) if path.suffix.casefold() == ".pdf" else read_markdown(path)
+    after = path.stat()
+    if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
+        raise OSError(f"Datei wurde waehrend des Lesens geaendert: {path}")
     normalized = normalize_text(text)
     fingerprint = hashlib.sha256(normalized.encode("utf-8", errors="ignore")).hexdigest()
     tokens = token_shingles(tokenize(normalized))
-    return Document(path=path, text=text, fingerprint=fingerprint, tokens=tokens)
+    return Document(path=path, text=text, fingerprint=fingerprint, tokens=tokens,
+                    signature=(after.st_size, after.st_mtime_ns))
 
 
 def similarity(left: Document, right: Document) -> float:
@@ -82,12 +132,22 @@ def similarity(left: Document, right: Document) -> float:
 
 
 def find_files(root: Path) -> list[Path]:
-    return sorted(
-        path for path in root.rglob("*")
-        if path.is_file()
-        and path.suffix.casefold() in SUPPORTED_EXTENSIONS
-        and OUTPUT_DIRECTORY not in path.relative_to(root).parts
-    )
+    own_directory = Path(__file__).resolve().parent.parent
+    files = []
+    def report_walk_error(error):
+        print(f"Hinweis: Ordner nicht lesbar: {error.filename}")
+    for directory, names, filenames in os.walk(root, followlinks=False, onerror=report_walk_error):
+        names[:] = sorted(name for name in names
+                          if name.casefold() not in SKIP_DIRECTORIES
+                          and not (Path(directory) / name).is_symlink()
+                          and not (hasattr(Path, "is_junction") and (Path(directory) / name).is_junction())
+                          and (Path(directory) / name).resolve() != own_directory)
+        for filename in sorted(filenames):
+            path = Path(directory) / filename
+            if (path.suffix.casefold() in SUPPORTED_EXTENSIONS and path.is_file()
+                    and not path.is_symlink()):
+                files.append(path)
+    return sorted(files)
 
 
 def build_groups(documents: list[Document], threshold: float) -> list[list[Document]]:
@@ -117,75 +177,148 @@ def make_group_name(group: Iterable[Document]) -> str:
     return name[:90]
 
 
-def unique_destination(directory: Path, filename: str) -> Path:
+def unique_destination(directory: Path, filename: str, reserved: set[Path] | None = None) -> Path:
+    reserved = reserved if reserved is not None else set()
     candidate = directory / filename
-    if not candidate.exists():
+    if not candidate.exists() and not candidate.is_symlink() and candidate not in reserved:
         return candidate
     stem, suffix = candidate.stem, candidate.suffix
     index = 2
     while True:
         candidate = directory / f"{stem}_{index}{suffix}"
-        if not candidate.exists():
+        if not candidate.exists() and not candidate.is_symlink() and candidate not in reserved:
             return candidate
         index += 1
 
 
-def organize(root: Path, threshold: float, apply: bool, assume_yes: bool = False) -> None:
+def organize(root: Path, threshold: float, apply: bool) -> None:
+    print(f"Suche Markdown- und PDF-Dateien unter: {root}", flush=True)
     files = find_files(root)
-    documents = [load_document(path) for path in files]
+    documents = []
+    for index, path in enumerate(files, start=1):
+        if index == 1 or index % 100 == 0:
+            print(f"Lese Datei {index} von {len(files)} ...", flush=True)
+        try:
+            documents.append(load_document(path))
+        except OSError as error:
+            print(f"Hinweis: Datei uebersprungen: {path} ({error})")
     empty = [doc for doc in documents if not doc.text.strip()]
     documents = [doc for doc in documents if doc.text.strip()]
     groups = build_groups(documents, threshold)
 
-    print(f"Scanned: {len(files)} files under {root}")
+    print(f"Geprueft: {len(files)} Dateien unter {root}")
     if empty:
-        print(f"Skipped unreadable/empty files: {len(empty)}")
+        print(f"Leere oder nicht auslesbare Dateien uebersprungen: {len(empty)}")
     movable_groups = [group for group in groups if len(group) >= 2]
     if not movable_groups:
-        print("No groups with at least two similar files were found. Nothing will be moved.")
+        print("Keine Gruppen mit mindestens zwei aehnlichen Dateien gefunden. Es wird nichts verschoben.")
         return
 
-    if apply and not assume_yes:
-        print(f"\nReady to move {sum(map(len, movable_groups))} files into '{OUTPUT_DIRECTORY}'.")
-        answer = input("Type JA to continue, or press Enter to cancel: ").strip()
-        if answer != "JA":
-            print("Cancelled. No files were moved.")
-            return
-
+    plan = []
+    reserved = set()
+    print("\nVORSCHAU - bisher wurden keine Dateien verschoben oder Sortierordner angelegt.")
     for group_number, group in enumerate(movable_groups, start=1):
-        if len(group) < 2:
-            continue
         folder = root / OUTPUT_DIRECTORY / make_group_name(group)
-        print(f"\nGroup {group_number}: {folder.name} ({len(group)} files)")
-        if apply:
-            folder.mkdir(parents=True, exist_ok=True)
+        print(f"\nGruppe {group_number}: {folder.name} ({len(group)} Dateien)")
         for document in group:
-            destination = unique_destination(folder, document.path.name)
-            print(f"  {'MOVE' if apply else 'WOULD MOVE'} {document.path} -> {destination}")
-            if apply:
-                shutil.move(str(document.path), str(destination))
+            destination = unique_destination(folder, document.path.name, reserved)
+            reserved.add(destination)
+            plan.append(Move(document, destination))
+            print(f"  {document.path}\n    -> {destination}")
+
+    print(f"\nVorschlag: {len(plan)} Dateien in {len(movable_groups)} Gruppen.")
+    if not apply:
+        print("Nur Vorschau. Es wurde nichts verschoben.")
+        return
+    try:
+        answer = input("Erst alle Vorschlaege pruefen. Exakt JA eingeben und Enter druecken zum Verschieben; sonst nur Enter: ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+    if answer != "JA":
+        print("\nAbgebrochen. Es wurden keine Dateien verschoben.")
+        return
+
+    # Validate the whole plan before creating output directories.
+    for move in plan:
+        source = move.document.path
+        stat = source.stat()
+        if source.is_symlink() or (stat.st_size, stat.st_mtime_ns) != move.document.signature:
+            raise OSError(f"Datei seit Vorschau geaendert. Bitte neu starten: {source}")
+        target_directory = move.destination.parent
+        for directory in (target_directory, target_directory.parent):
+            if (directory.is_symlink() or (hasattr(Path, "is_junction") and directory.is_junction())
+                    or (directory.exists() and not directory.is_dir())):
+                raise OSError(f"Unsicherer oder blockierter Zielordner: {directory}")
+        if move.destination.exists() or move.destination.is_symlink():
+            raise OSError(f"Ziel ist seit Vorschau belegt. Bitte neu starten: {move.destination}")
+
+    completed = 0
+    try:
+        for move in plan:
+            move.destination.parent.mkdir(parents=True, exist_ok=True)
+            # Exclusive creation protects existing files even if another process creates a target.
+            created = False
+            try:
+                with move.document.path.open("rb") as reader, move.destination.open("xb") as writer:
+                    created = True
+                    shutil.copyfileobj(reader, writer)
+                    writer.flush()
+                    os.fsync(writer.fileno())
+                shutil.copystat(move.document.path, move.destination)
+                current = move.document.path.stat()
+                if (current.st_size, current.st_mtime_ns) != move.document.signature:
+                    raise OSError(f"Quelldatei wurde beim Verschieben geaendert: {move.document.path}")
+                move.document.path.unlink()
+            except (OSError, KeyboardInterrupt):
+                if created and move.document.path.exists():
+                    move.destination.unlink(missing_ok=True)
+                raise
+            completed += 1
+            print(f"Verschoben: {move.document.path} -> {move.destination}")
+    except (OSError, KeyboardInterrupt):
+        print(f"Vorgang gestoppt. Bereits verschoben: {completed} von {len(plan)} Dateien.")
+        raise
+    print(f"\nFertig. {completed} Dateien wurden nach {root / OUTPUT_DIRECTORY} verschoben.")
+
+
+class GermanArgumentParser(argparse.ArgumentParser):
+    def format_usage(self):
+        return super().format_usage().replace("usage: ", "Aufruf: ", 1)
+
+    def format_help(self):
+        return super().format_help().replace("usage: ", "Aufruf: ", 1)
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(2, f"Fehler bei der Eingabe: {message}\n")
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sort Markdown/PDF chat histories into folders by similar story content.")
-    parser.add_argument("root", nargs="?", default=str(Path.home() / "Desktop"), help="Desktop folder to scan recursively (default: ~/Desktop)")
-    parser.add_argument("--threshold", type=float, default=0.32, help="Similarity threshold from 0.0 to 1.0 (default: 0.32)")
-    parser.add_argument("--apply", action="store_true", help="Ask for confirmation, then create folders and move files. Without this, only prints a dry run.")
-    parser.add_argument("--yes", action="store_true", help=argparse.SUPPRESS)
+    parser = GermanArgumentParser(description="Markdown- und PDF-Dateien nach aehnlichem Inhalt gruppieren.", add_help=False)
+    parser._positionals.title = "Ordner"
+    parser._optionals.title = "Optionen"
+    parser.add_argument("-h", "--help", action="help", help="Diese Hilfe anzeigen und beenden.")
+    parser.add_argument("root", nargs="?", default=str(default_desktop()), help="Zu durchsuchender Ordner samt Unterordnern (Standard: Windows-Desktop)")
+    parser.add_argument("--threshold", type=float, default=0.32, help="Aehnlichkeitsschwelle von 0.0 bis 1.0 (Standard: 0.32)")
+    parser.add_argument("--apply", action="store_true", help="Vorschau anzeigen und erst nach Eingabe von JA verschieben.")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
     if not 0.0 <= args.threshold <= 1.0:
-        raise SystemExit("--threshold must be between 0.0 and 1.0")
-    if args.yes and not args.apply:
-        raise SystemExit("--yes can only be used together with --apply")
+        raise SystemExit("Fehler: --threshold muss zwischen 0.0 und 1.0 liegen.")
     root = Path(args.root).expanduser().resolve()
     if not root.exists() or not root.is_dir():
-        raise SystemExit(f"Folder not found: {root}")
-    organize(root, args.threshold, args.apply, args.yes)
+        raise SystemExit(f"Fehler: Ordner nicht gefunden: {root}")
+    try:
+        organize(root, args.threshold, args.apply)
+    except OSError as error:
+        raise SystemExit(f"Fehler: {error}") from error
+    except KeyboardInterrupt:
+        raise SystemExit("\nVorgang durch Tastatur abgebrochen.")
 
 
 if __name__ == "__main__":
     main()
+
