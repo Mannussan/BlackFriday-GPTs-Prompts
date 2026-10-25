@@ -1,0 +1,2 @@
+# Optional dependency for extracting text from PDFs. Scanned PDFs need OCR first.
+pypdf==6.21.2
