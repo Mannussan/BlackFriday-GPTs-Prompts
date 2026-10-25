@@ -1,6 +1,8 @@
 import io
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
@@ -155,6 +157,31 @@ class OrganizeChatHistoriesTests(unittest.TestCase):
             organize(self.root, threshold=0.32, apply=True)
         self.assertTrue((self.root / "empty.md").exists())
         self.assertTrue((self.root / "unrelated.md").exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows-Starter")
+    def test_windows_cli_handles_long_destination_paths(self):
+        root_text = str(self.root.resolve()).removeprefix("\\\\?\\")
+        plain_root = Path(root_text) / ("Langer_Ordner_" + "a" * 55) / ("Weitere_Exporte_" + "b" * 55)
+        extended_root = Path("\\\\?\\" + str(plain_root))
+        extended_root.mkdir(parents=True)
+        try:
+            text = "weltraumforschung sternwarte teleskop beobachtung galaxien planeten"
+            for name in ("Erster Verlauf.md", "Zweiter Verlauf.md"):
+                (extended_root / name).write_text(text, encoding="utf-8")
+            script = Path(__file__).resolve().parents[1] / "tools" / "organize_chat_histories.py"
+            result = subprocess.run([sys.executable, str(script), str(plain_root), "--apply"],
+                                    input="JA\n", capture_output=True, text=True, encoding="utf-8",
+                                    timeout=30, env={**os.environ, "PYTHONUTF8": "1"})
+            self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+            targets = list((extended_root / OUTPUT_DIRECTORY).rglob("*.md"))
+            self.assertEqual(2, len(targets))
+            self.assertTrue(all(p.read_text(encoding="utf-8") == text for p in targets))
+            self.assertTrue(all(not (extended_root / name).exists() for name in
+                                ("Erster Verlauf.md", "Zweiter Verlauf.md")))
+            self.assertNotIn("\\\\?\\", result.stdout)
+        finally:
+            extended_root.relative_to(Path("\\\\?\\" + root_text))
+            shutil.rmtree(extended_root)
 
     @unittest.skipUnless(os.name == "nt", "Windows-Starter")
     def test_windows_launcher_previews_and_cancels_with_spaces_in_path(self):
