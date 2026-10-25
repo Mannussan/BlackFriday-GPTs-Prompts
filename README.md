@@ -30,3 +30,30 @@ https://github.com/friuns2/BlackFriday-GPTs-Prompts/assets/16543239/c172af20-9bd
 
 
 
+
+## Chatverläufe auf dem Desktop sortieren
+
+Mit `tools/organize_chat_histories.py` können Markdown- und PDF-Chatverläufe rekursiv unter dem Desktop gescannt und nach ähnlichem Geschichten-/Themeninhalt gruppiert werden. Standardmäßig läuft das Werkzeug als Trockenlauf und verschiebt noch nichts:
+
+**Es läuft nichts im Hintergrund.** Nach dem Herunterladen oder Zusammenführen muss das Werkzeug bewusst in einem Terminal gestartet werden. Der erste Befehl ist nur eine Vorschau; dabei werden weder Dateien verschoben noch Ordner angelegt:
+
+```bash
+python3 tools/organize_chat_histories.py ~/Desktop
+```
+
+Wenn die vorgeschlagenen Gruppen passen, kann derselbe Befehl mit `--apply` gestartet werden:
+
+```bash
+python3 tools/organize_chat_histories.py ~/Desktop --apply
+```
+
+Das Werkzeug zeigt dann die Anzahl der betroffenen Dateien und wartet auf eine letzte Bestätigung. Nur wenn exakt `JA` eingegeben und mit der Eingabetaste bestätigt wird, werden die Dateien verschoben. Jede andere Eingabe bricht ohne Änderungen ab. Die sortierten Dateien landen gesammelt unter `Desktop/Chatverlaeufe_sortiert/Geschichte_...`; vorhandene Originalnamen werden beibehalten und Namenskollisionen sicher nummeriert.
+
+Kurz gesagt:
+
+1. Terminal öffnen.
+2. Den ersten Befehl **ohne** `--apply` ausführen und die Vorschau lesen.
+3. Nur bei passenden Vorschlägen den zweiten Befehl **mit** `--apply` ausführen.
+4. Erst nach der angezeigten Rückfrage `JA` eingeben. Bis dahin wurde nichts verschoben.
+
+Falls zu viele oder zu wenige Dateien zusammengefasst werden, kann die Ähnlichkeitsschwelle angepasst werden, zum Beispiel strenger mit `--threshold 0.45` oder lockerer mit `--threshold 0.20`.
